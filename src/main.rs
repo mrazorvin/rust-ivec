@@ -1,30 +1,26 @@
-use core::panic;
 use std::{
     alloc::{dealloc, Layout},
     marker::PhantomData,
     mem::{ManuallyDrop, MaybeUninit},
     ops::Deref,
-    sync::atomic::{AtomicPtr, Ordering},
+    sync::atomic::{AtomicPtr, AtomicU32, Ordering},
 };
 
-const IVEC_ROOT_SNAPSHOT: IVecSnapshot<()> =
-    IVecSnapshot { len: 0, data: [], prev: std::ptr::null_mut() };
-
-#[repr(C, align(8))]
-struct IVecSnapshotUsized<T> {
+#[repr(C)]
+struct IVecSnapshot<T, const LEN: usize = 0> {
     len: usize,
     prev: *mut u8,
-    data: [T],
+    data: [T; LEN],
 }
 
 unsafe impl<T, const N: usize> Send for IVecSnapshot<T, N> {}
 unsafe impl<T, const N: usize> Sync for IVecSnapshot<T, N> {}
 
-#[repr(C, align(8))]
-struct IVecSnapshot<T, const LEN: usize = 0> {
+#[repr(C)]
+struct IVecSnapshotUsized<T> {
     len: usize,
     prev: *mut u8,
-    data: [T; LEN],
+    data: [T],
 }
 
 struct IVec<T> {
@@ -66,7 +62,11 @@ fn get_ivec_layout<T>(len: usize) -> Layout {
 impl<T> IVec<T> {
     const fn new() -> Self {
         Self {
-            root: AtomicPtr::new(&IVEC_ROOT_SNAPSHOT as *const _ as *mut _),
+            root: AtomicPtr::new(&IVecSnapshot {
+                len: 0,
+                data: [] as [T; 0],
+                prev: std::ptr::null_mut(),
+            } as *const _ as *mut _),
             _marker: PhantomData {},
         }
     }
@@ -78,14 +78,17 @@ impl<T> IVec<T> {
     {
         assert_eq!(vec![0u8; std::mem::size_of::<IVecSnapshot<T>>()].as_slice(), unsafe {
             std::slice::from_raw_parts(
-                &IVEC_ROOT_SNAPSHOT as *const _ as *const u8,
+                &IVecSnapshot { len: 0, data: [] as [T; 0], prev: std::ptr::null_mut() } as *const _
+                    as *const u8,
                 std::mem::size_of::<IVecSnapshot<T>>(),
             )
         });
 
         assert_eq!(
             std::mem::size_of::<IVecSnapshot::<T>>()
-                + (std::mem::size_of::<[T; 9]>() as f32 / 8.0).ceil() as usize
+                + (std::mem::size_of::<[T; 9]>() as f32
+                    / std::mem::align_of::<IVecSnapshot<T>>() as f32)
+                    .ceil() as usize
                     * std::mem::align_of::<IVecSnapshot<T>>(),
             std::mem::size_of::<IVecSnapshot::<T, 9>>(),
             "IVecSnapshot size is uknown, probably because of changes of rust representation"
@@ -168,7 +171,8 @@ impl<T> IVec<T> {
 impl<T> Drop for IVec<T> {
     fn drop(&mut self) {
         let root_ptr = self.root.load(Ordering::Acquire);
-        if root_ptr == &IVEC_ROOT_SNAPSHOT as *const _ as *mut _ {
+        let ivec = unsafe { &*read_unsized_ivec::<T>(root_ptr) };
+        if ivec.len == 0 {
             return;
         }
 
@@ -235,11 +239,36 @@ fn ivec_upsert_sort() {
 }
 
 #[test]
+fn ivec_align() {
+    #[derive(Clone, Copy)]
+    #[repr(C, align(16))]
+    struct DifferentAlign {
+        x: u128,
+        y: u128,
+    }
+
+    let ivec_1: IVec<_> = IVec::new();
+    ivec_1.get_or_insert(0, &|| (0, DifferentAlign { x: 0, y: 0 }));
+
+    drop(ivec_1);
+}
+
+#[test]
+fn ivec_empty_drop() {
+    // * ivec could be dropped without any allocations
+
+    let ivec_1: IVec<usize> = IVec::new();
+    let ivec_2: IVec<usize> = IVec::new();
+
+    drop(ivec_1);
+    drop(ivec_2)
+}
+
+#[test]
 fn ivec_mutli_thread_insert_double_free() {
-    // This function tests:
-    // * That ref-counting could be stored inside Vec
-    // * That our code propperly call drop once for stored values
-    // * That our code doesn't cause double memory free
+    // * ivec can store ref-counting types
+    // * ivec propperly call drop only once for stored values, but also propperly clear all memory
+    // * ivec code doesn't cause double memory free
 
     use std::sync::Arc;
 
