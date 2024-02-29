@@ -169,7 +169,7 @@ impl<T> IVec<T> {
         }
     }
 
-    unsafe fn clear_prev_snapshots(&self, root_ptr: *mut u8) -> bool {
+    unsafe fn _clear_prev_snapshots(&self, root_ptr: *mut u8) -> bool {
         let ivec = unsafe { &*read_unsized_ivec::<T>(root_ptr) };
         if ivec.len == 0 {
             return false;
@@ -180,19 +180,24 @@ impl<T> IVec<T> {
         if prev_len != 0 {
             unsafe { read_mut_unsized_ivec::<ManuallyDrop<T>>(ivec.prev).drop_in_place() }
             unsafe { dealloc(ivec.prev, get_ivec_layout::<T>(prev_len)) }
+            let ivec = unsafe { &mut *read_mut_unsized_ivec::<T>(root_ptr) };
+            ivec.prev = &IVecSnapshot { len: 0, data: [] as [T; 0], prev: std::ptr::null_mut() }
+                as *const _ as *mut _;
         }
-        let ivec = unsafe { &mut *read_mut_unsized_ivec::<T>(root_ptr) };
-        ivec.prev = &IVecSnapshot { len: 0, data: [] as [T; 0], prev: std::ptr::null_mut() }
-            as *const _ as *mut _;
 
         true
+    }
+
+    pub unsafe fn clear_prev_snapshots(&self) -> bool {
+        let root_ptr = self.root.load(Ordering::Acquire);
+        self._clear_prev_snapshots(root_ptr)
     }
 }
 
 impl<T> Drop for IVec<T> {
     fn drop(&mut self) {
         let root_ptr = self.root.load(Ordering::Acquire);
-        let is_prev_snapshots_cleared = unsafe { self.clear_prev_snapshots(root_ptr) };
+        let is_prev_snapshots_cleared = unsafe { self._clear_prev_snapshots(root_ptr) };
         if is_prev_snapshots_cleared {
             let ivec_len = unsafe {
                 let root_mut = read_mut_unsized_ivec::<T>(root_ptr);
@@ -256,7 +261,25 @@ fn ivec_upsert_sort() {
 }
 
 #[test]
-fn ivec_align() {
+fn ivec_snapshot_clear() {
+    let ivec: IVec<usize> = IVec::new();
+
+    ivec.get_or_insert(4, &|| 4);
+    ivec.get_or_insert(2, &|| 2);
+    ivec.get_or_insert(1, &|| 1);
+    ivec.get_or_insert(3, &|| 3);
+
+    assert!(unsafe { ivec.clear_prev_snapshots() });
+    assert!(unsafe { ivec.clear_prev_snapshots() });
+
+    let empty_ivec: IVec<()> = IVec::new();
+    assert!(!unsafe { empty_ivec.clear_prev_snapshots() });
+
+    assert_eq!(&ivec[..], &[1, 2, 3, 4]);
+}
+
+#[test]
+fn ivec_custom_align() {
     #[derive(Clone, Copy)]
     #[repr(C, align(16))]
     struct DifferentAlign {
