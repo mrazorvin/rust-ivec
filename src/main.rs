@@ -3,8 +3,11 @@ use std::{
     marker::PhantomData,
     mem::{ManuallyDrop, MaybeUninit},
     ops::Deref,
-    sync::atomic::{AtomicPtr, AtomicU32, Ordering},
+    sync::atomic::{AtomicPtr, Ordering},
 };
+
+unsafe impl<T, const N: usize> Send for IVecSnapshot<T, N> {}
+unsafe impl<T, const N: usize> Sync for IVecSnapshot<T, N> {}
 
 #[repr(C)]
 struct IVecSnapshot<T, const LEN: usize = 0> {
@@ -13,11 +16,8 @@ struct IVecSnapshot<T, const LEN: usize = 0> {
     data: [T; LEN],
 }
 
-unsafe impl<T, const N: usize> Send for IVecSnapshot<T, N> {}
-unsafe impl<T, const N: usize> Sync for IVecSnapshot<T, N> {}
-
 #[repr(C)]
-struct IVecSnapshotUsized<T> {
+struct IVecSnapshotUnsized<T> {
     len: usize,
     prev: *mut u8,
     data: [T],
@@ -41,12 +41,12 @@ trait IVecEntry<T: PartialEq + Eq + 'static> {
     fn ivec_id(&self) -> T;
 }
 
-fn read_unsized_ivec<T>(ptr: *const u8) -> *const IVecSnapshotUsized<T> {
+fn read_unsized_ivec<T>(ptr: *const u8) -> *const IVecSnapshotUnsized<T> {
     let len = unsafe { &*(ptr as *const IVecSnapshot<T>) }.len;
     std::ptr::slice_from_raw_parts(ptr as *mut T, len) as *const _
 }
 
-fn read_mut_unsized_ivec<T>(ptr: *mut u8) -> *mut IVecSnapshotUsized<T> {
+fn read_mut_unsized_ivec<T>(ptr: *mut u8) -> *mut IVecSnapshotUnsized<T> {
     let len = unsafe { &*(ptr as *const IVecSnapshot<T>) }.len;
     std::ptr::slice_from_raw_parts_mut(ptr as *mut T, len) as *mut _
 }
@@ -64,8 +64,8 @@ impl<T> IVec<T> {
         Self {
             root: AtomicPtr::new(&IVecSnapshot {
                 len: 0,
-                data: [] as [T; 0],
                 prev: std::ptr::null_mut(),
+                data: [] as [T; 0],
             } as *const _ as *mut _),
             _marker: PhantomData {},
         }
@@ -96,14 +96,14 @@ impl<T> IVec<T> {
 
         let mut root_ptr = self.root.load(Ordering::Acquire);
         'new_version: loop {
-            let root: &IVecSnapshotUsized<T> = unsafe { &*read_unsized_ivec(root_ptr) };
+            let root: &IVecSnapshotUnsized<T> = unsafe { &*read_unsized_ivec(root_ptr) };
             if let Ok(result) = root.data.binary_search_by(|value| value.ivec_id().cmp(&id)) {
                 return unsafe { root.data.get_unchecked(result) };
             }
 
             let new_vec_len = root.len + 1;
             let new_vec_u8 = unsafe { std::alloc::alloc_zeroed(get_ivec_layout::<T>(new_vec_len)) };
-            let new_vec: *mut [MaybeUninit<T>] =
+            let new_vec_fat_ptr: *mut [MaybeUninit<T>] =
                 std::ptr::slice_from_raw_parts_mut(new_vec_u8 as *mut MaybeUninit<T>, new_vec_len);
 
             {
@@ -111,7 +111,8 @@ impl<T> IVec<T> {
                 unsafe {
                     std::ptr::copy(
                         &root.data as *const _ as *const T,
-                        &mut (*(new_vec as *mut IVecSnapshotUsized<T>)).data as *mut _ as *mut T,
+                        &mut (*(new_vec_fat_ptr as *mut IVecSnapshotUnsized<T>)).data as *mut _
+                            as *mut T,
                         root.len,
                     );
                 }
@@ -122,7 +123,8 @@ impl<T> IVec<T> {
                 // insert new item
                 unsafe {
                     std::ptr::write(
-                        (&mut (*(new_vec as *mut IVecSnapshotUsized<T>)).data as *mut _ as *mut T)
+                        (&mut (*(new_vec_fat_ptr as *mut IVecSnapshotUnsized<T>)).data as *mut _
+                            as *mut T)
                             .add(root.len),
                         data,
                     );
@@ -130,7 +132,7 @@ impl<T> IVec<T> {
             }
 
             {
-                let new_vec = unsafe { &mut *(new_vec as *mut IVecSnapshotUsized<T>) };
+                let new_vec = unsafe { &mut *(new_vec_fat_ptr as *mut IVecSnapshotUnsized<T>) };
                 new_vec.len = new_vec_len;
                 new_vec.prev = root_ptr;
                 new_vec.data.sort_by_key(|v1| v1.ivec_id());
@@ -145,11 +147,11 @@ impl<T> IVec<T> {
 
             match root_switch {
                 Ok(_) => {
-                    let new_vec = unsafe { &*(new_vec as *mut IVecSnapshotUsized<T>) };
+                    let new_vec = unsafe { &*(new_vec_fat_ptr as *mut IVecSnapshotUnsized<T>) };
                     break unsafe { new_vec.data.get_unchecked(root.len) };
                 }
                 Err(new_root_ptr) => {
-                    let new_vec = unsafe { &mut *(new_vec as *mut IVecSnapshotUsized<T>) };
+                    let new_vec = unsafe { &mut *(new_vec_fat_ptr as *mut IVecSnapshotUnsized<T>) };
                     if let Ok(result) =
                         new_vec.data.binary_search_by(|value| value.ivec_id().cmp(&id))
                     {
@@ -166,35 +168,50 @@ impl<T> IVec<T> {
             };
         }
     }
+
+    unsafe fn clear_prev_snapshots(&self, root_ptr: *mut u8) -> bool {
+        let ivec = unsafe { &*read_unsized_ivec::<T>(root_ptr) };
+        if ivec.len == 0 {
+            return false;
+        }
+
+        let prev_ivec = read_unsized_ivec::<ManuallyDrop<T>>(ivec.prev);
+        let prev_len = unsafe { &*prev_ivec }.len;
+        if prev_len != 0 {
+            unsafe { read_mut_unsized_ivec::<ManuallyDrop<T>>(ivec.prev).drop_in_place() }
+            unsafe { dealloc(ivec.prev, get_ivec_layout::<T>(prev_len)) }
+        }
+        let ivec = unsafe { &mut *read_mut_unsized_ivec::<T>(root_ptr) };
+        ivec.prev = &IVecSnapshot { len: 0, data: [] as [T; 0], prev: std::ptr::null_mut() }
+            as *const _ as *mut _;
+
+        true
+    }
 }
 
 impl<T> Drop for IVec<T> {
     fn drop(&mut self) {
         let root_ptr = self.root.load(Ordering::Acquire);
-        let ivec = unsafe { &*read_unsized_ivec::<T>(root_ptr) };
-        if ivec.len == 0 {
-            return;
+        let is_prev_snapshots_cleared = unsafe { self.clear_prev_snapshots(root_ptr) };
+        if is_prev_snapshots_cleared {
+            let ivec_len = unsafe {
+                let root_mut = read_mut_unsized_ivec::<T>(root_ptr);
+                let len = (*root_mut).len;
+                root_mut.drop_in_place();
+                len
+            };
+            unsafe { dealloc(root_ptr, get_ivec_layout::<T>(ivec_len)) }
         }
-
-        let ivec = unsafe { &mut *read_mut_unsized_ivec::<T>(root_ptr) };
-        let len = ivec.len;
-        if ivec.len > 1 {
-            unsafe { read_mut_unsized_ivec::<ManuallyDrop<T>>(ivec.prev).drop_in_place() }
-            unsafe { dealloc(ivec.prev, get_ivec_layout::<T>(len - 1)) }
-        }
-        ivec.prev = std::ptr::null_mut();
-
-        unsafe { read_mut_unsized_ivec::<T>(root_ptr).drop_in_place() };
-        unsafe { dealloc(root_ptr, get_ivec_layout::<T>(len)) }
     }
 }
 
-impl<T> Drop for IVecSnapshotUsized<T> {
+impl<T> Drop for IVecSnapshotUnsized<T> {
     fn drop(&mut self) {
-        if self.len > 1 && !self.prev.is_null() {
-            let ivec: *mut IVecSnapshotUsized<T> = read_mut_unsized_ivec(self.prev);
-            unsafe { ivec.drop_in_place() }
-            unsafe { dealloc(self.prev, get_ivec_layout::<T>(self.len - 1)) }
+        let prev_ivec = read_unsized_ivec::<ManuallyDrop<T>>(self.prev);
+        let prev_len = unsafe { &*prev_ivec }.len;
+        if prev_len != 0 {
+            unsafe { read_mut_unsized_ivec::<T>(self.prev).drop_in_place() }
+            unsafe { dealloc(self.prev, get_ivec_layout::<T>(prev_len)) }
         }
     }
 }
