@@ -2,7 +2,6 @@ use std::{
     alloc::{dealloc, Layout},
     marker::PhantomData,
     mem::{ManuallyDrop, MaybeUninit},
-    ops::Deref,
     sync::atomic::{AtomicPtr, Ordering},
 };
 
@@ -23,35 +22,25 @@ struct IVecSnapshotUnsized<T> {
 }
 
 // SAFETY: We can't add non send/sync entries into ivec, that why we don't need to bound T with Send + Sync
+
 struct IVec<T> {
     root: AtomicPtr<u8>,
     _marker: PhantomData<T>,
-}
-
-// IMPORTANT: We should be very carefully with dereferencing `IVec` as slice
-//            because this allows us take reference to value in cleared snapshot.
-//            Better approach will be to create custom iterator that returns value clones
-//            and validate pointer every call
-impl<T> Deref for IVec<T> {
-    type Target = [T];
-
-    #[inline]
-    fn deref(&self) -> &[T] {
-        unsafe { &(*read_unsized_ivec(self.root.load(Ordering::Acquire))).data }
-    }
 }
 
 trait IVecEntry<T: PartialEq + Eq + 'static> {
     fn ivec_id(&self) -> T;
 }
 
-fn read_unsized_ivec<T>(ptr: *const u8) -> *const IVecSnapshotUnsized<T> {
-    let len = unsafe { &*(ptr as *const IVecSnapshot<T>) }.len;
+// SAFETY: caller must garantee that ptr point to valid IVecSnapshotUnsized instance
+unsafe fn read_unsized_ivec<T>(ptr: *const u8) -> *const IVecSnapshotUnsized<T> {
+    let len = (*(ptr as *const IVecSnapshot<T>)).len;
     std::ptr::slice_from_raw_parts(ptr as *mut T, len) as *const _
 }
 
-fn read_mut_unsized_ivec<T>(ptr: *mut u8) -> *mut IVecSnapshotUnsized<T> {
-    let len = unsafe { &*(ptr as *const IVecSnapshot<T>) }.len;
+// SAFETY: caller must garantee that ptr point to valid IVecSnapshotUnsized instance
+unsafe fn read_mut_unsized_ivec<T>(ptr: *mut u8) -> *mut IVecSnapshotUnsized<T> {
+    let len = (*(ptr as *const IVecSnapshot<T>)).len;
     std::ptr::slice_from_raw_parts_mut(ptr as *mut T, len) as *mut _
 }
 
@@ -75,11 +64,19 @@ impl<T> IVec<T> {
         }
     }
 
-    fn get_or_insert<TId>(&self, id: TId, init_data: &dyn Fn() -> T) -> &T
+    // SAFETY: You should be very carefully with casting `IVec` to slice
+    //         because this allows you to take reference to value in cleared snapshot.
+    //         You must garantue by yourself that no-one called clear_prev_snapshots
+    unsafe fn as_slice(&self) -> &[T] {
+        &(*read_unsized_ivec(self.root.load(Ordering::Acquire))).data
+    }
+
+    fn get_or_insert<TId>(&self, id: TId, init_data: &dyn Fn() -> T) -> T
     where
         TId: Ord + 'static,
         T: Sync + Send + Clone + IVecEntry<TId>,
     {
+        // SAFETY: obvious safe
         assert_eq!(vec![0u8; std::mem::size_of::<IVecSnapshot<T>>()].as_slice(), unsafe {
             std::slice::from_raw_parts(
                 &IVecSnapshot { len: 0, data: [] as [T; 0], prev: std::ptr::null_mut() } as *const _
@@ -102,7 +99,7 @@ impl<T> IVec<T> {
         'new_version: loop {
             let root: &IVecSnapshotUnsized<T> = unsafe { &*read_unsized_ivec(root_ptr) };
             if let Ok(result) = root.data.binary_search_by(|value| value.ivec_id().cmp(&id)) {
-                return unsafe { root.data.get_unchecked(result) };
+                return unsafe { root.data.get_unchecked(result).clone() };
             }
 
             let new_vec_len = root.len + 1;
@@ -152,7 +149,7 @@ impl<T> IVec<T> {
             match root_switch {
                 Ok(_) => {
                     let new_vec = unsafe { &*(new_vec_fat_ptr as *mut IVecSnapshotUnsized<T>) };
-                    break unsafe { new_vec.data.get_unchecked(root.len) };
+                    break unsafe { new_vec.data.get_unchecked(root.len).clone() };
                 }
                 Err(new_root_ptr) => {
                     let new_vec = unsafe { &mut *(new_vec_fat_ptr as *mut IVecSnapshotUnsized<T>) };
@@ -212,8 +209,7 @@ impl<T> Drop for IVec<T> {
 
 impl<T> Drop for IVecSnapshotUnsized<T> {
     fn drop(&mut self) {
-        let prev_ivec = read_unsized_ivec::<ManuallyDrop<T>>(self.prev);
-        let prev_len = unsafe { &*prev_ivec }.len;
+        let prev_len = unsafe { (*read_unsized_ivec::<ManuallyDrop<T>>(self.prev)).len };
         if prev_len != 0 {
             unsafe { read_mut_unsized_ivec::<T>(self.prev).drop_in_place() }
             unsafe { dealloc(self.prev, get_ivec_layout::<T>(prev_len)) }
@@ -242,15 +238,13 @@ impl<T> IVecEntry<usize> for (usize, T) {
 fn main() {
     let ivec: IVec<usize> = IVec::new();
 
-    println!("{}", ivec.len());
-
     ivec.get_or_insert(4, &|| 4);
     ivec.get_or_insert(4, &|| 4);
     ivec.get_or_insert(2, &|| 2);
     ivec.get_or_insert(1, &|| 1);
     ivec.get_or_insert(3, &|| 3);
 
-    println!("{:?}", &ivec[..]);
+    println!("{:?}", unsafe { ivec.as_slice() });
 }
 
 #[test]
@@ -263,7 +257,7 @@ fn ivec_static_upsert_sort() {
         IVEC.get_or_insert(value, &|| value);
     }
 
-    assert_eq!(IVEC[..], expection[..]);
+    assert_eq!(unsafe { IVEC.as_slice() }, &expection[..]);
 }
 
 #[test]
@@ -282,7 +276,7 @@ fn ivec_snapshot_clear() {
     // you can uncomment following line and run this test with miri
     // println!("{}", *_x);
 
-    assert_eq!(&ivec[..], &[1, 2, 3, 4]);
+    assert_eq!(unsafe { ivec.as_slice() }, &[1, 2, 3, 4]);
 }
 
 #[test]
@@ -328,7 +322,7 @@ fn ivec_mutli_thread_insert_drop() {
     let ivec_arc = Arc::new(IVec::new());
     let ivec_box = Arc::new(IVec::new());
     let expection: Vec<_> =
-        (100..5000).step_by(123).map(|value| (value, Arc::new(value))).collect();
+        (100usize..5000).step_by(123).map(|value| (value, Arc::new(value))).collect();
 
     let threads: Vec<_> = (100..5000)
         .step_by(123)
@@ -352,5 +346,5 @@ fn ivec_mutli_thread_insert_drop() {
         t.join().unwrap();
     }
 
-    assert_eq!(ivec_arc[..], expection[..]);
+    assert_eq!(unsafe { ivec_arc.as_slice() }, &expection[..]);
 }
