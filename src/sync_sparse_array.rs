@@ -52,13 +52,7 @@ impl<T> SyncSparseArray<T> {
      */
     unsafe fn get_bucket_unchecked(&self, id: usize) -> *mut Bucket<T> {
         assert!(id < MAX_ITEMS_PER_ARRAY);
-
         let bucket_idx = get_bucket_idx(id);
-        let bucket_ptr = self.buckets[bucket_idx].load(Ordering::Relaxed);
-        if !bucket_ptr.is_null() {
-            return bucket_ptr;
-        }
-
         self.buckets[bucket_idx].load(Ordering::Acquire)
     }
 
@@ -73,7 +67,7 @@ impl<T> SyncSparseArray<T> {
             let swap_result = self.buckets[get_bucket_idx(id)].compare_exchange(
                 std::ptr::null_mut(),
                 bucket_ptr,
-                Ordering::Acquire,
+                Ordering::AcqRel,
                 Ordering::Acquire,
             );
             match swap_result {
@@ -131,7 +125,7 @@ impl<T> SyncSparseArray<T> {
     pub fn bucket(&self, id: usize) -> BucketRef<T> {
         let bucket_ptr = unsafe { self.get_bucket_unchecked(id) };
 
-        BucketRef { bucket_ptr, _bits: self.bucket_bits[get_bucket_idx(id)].as_ptr() }
+        BucketRef { bucket_ptr, bits: self.bucket_bits[get_bucket_idx(id)].as_ptr() }
     }
 
     pub fn delete_in_place(&self, id: usize) -> Option<T> {
@@ -164,18 +158,23 @@ impl<T> Drop for SyncSparseArray<T> {
 
             let bucket_ptr = self.buckets[bucket_idx].load(Ordering::Acquire);
             if !bucket_ptr.is_null() {
-                unsafe { self.buckets[bucket_idx].load(Ordering::Acquire).drop_in_place() }
+                unsafe { drop(Box::from_raw(bucket_ptr)) };
             }
         }
     }
 }
 
 pub struct BucketRef<T> {
-    _bits: *mut u64,
-    pub bucket_ptr: *mut Bucket<T>,
+    bits: *mut u64,
+    bucket_ptr: *mut Bucket<T>,
 }
 
 impl<T> BucketRef<T> {
+    #[allow(dead_code)]
+    pub fn bits(&self) -> u64 {
+        unsafe { *self.bits }
+    }
+
     pub unsafe fn get_unchecked(&self, id: usize) -> &T {
         (*(*self.bucket_ptr).slots.get_unchecked(get_slot_index(id))).assume_init_ref()
     }
@@ -188,7 +187,7 @@ pub struct BucketRefMut<T> {
 }
 
 impl<T> BucketRefMut<T> {
-    pub fn set(&self, id: usize, data: T) -> Option<T> {
+    pub fn set(&mut self, id: usize, data: T) -> Option<T> {
         assert!(id < MAX_ITEMS_PER_ARRAY);
 
         let prev_value = std::mem::replace(
@@ -355,6 +354,83 @@ impl<T> Default for Bucket<T> {
 }
 
 #[test]
+fn test_bucket_lock_api() {
+    let id = 123;
+    let array = sync_array();
+
+    let mut bucket = array.bucket_lock(id);
+    assert_eq!(bucket.set(id, String::from("value for id 123")), None);
+    assert_eq!(array.min_relaxed(), 123);
+    assert_eq!(array.max_relaxed(), 123);
+    assert_eq!(array.bits(id), 1 << (id % 64));
+    assert!(bucket.has(id));
+
+    let value = unsafe { bucket.get_mut_unchecked(id) };
+    value.push_str(" with additional info");
+
+    let value = unsafe { bucket.get_unchecked(id) }.clone();
+
+    assert_eq!(Some(value.clone()), Some(String::from("value for id 123 with additional info")));
+    assert_eq!(bucket.delete(id), Some(value.clone()));
+    assert_eq!(array.min_relaxed(), MAX_ITEMS_PER_ARRAY as u16);
+    assert_eq!(array.max_relaxed(), 0);
+    assert_eq!(array.bits(id), 0);
+    assert!(!bucket.has(id));
+
+    drop(bucket);
+}
+
+#[test]
+fn test_bucket_multithread_read_write() {
+    use std::sync::{Arc, Mutex};
+
+    let array: SyncSparseArray<Arc<u32>> = sync_array();
+    let sparse: &'static SyncSparseArray<_> = unsafe { std::mem::transmute(&array) };
+    let threads: Vec<_> = (100..1250)
+        .step_by(30)
+        .map(|value| {
+            let id = Arc::new(value);
+            std::thread::spawn(move || {
+                let mut bucket = sparse.bucket_lock(*id);
+                bucket.set(*id, id);
+            })
+        })
+        .collect();
+
+    for t in threads {
+        t.join().unwrap();
+    }
+
+    let expection: Vec<_> = (100..1250).step_by(30).collect();
+    let vec = Arc::new(Mutex::new(Vec::new()));
+    let threads: Vec<_> = (0..BUCKETS_PER_ARRAY)
+        .map(|bucket_id| {
+            let vec = vec.clone();
+            std::thread::spawn(move || {
+                let bucket = sparse.bucket(bucket_id * 64);
+                for bit_id in 0..64 {
+                    let bit = bucket.bits() & (1 << bit_id);
+                    if bit != 0 {
+                        let value = **unsafe { bucket.get_unchecked(bucket_id * 64 + bit_id) };
+                        vec.lock().unwrap().push(value);
+                    }
+                }
+            })
+        })
+        .collect();
+
+    for t in threads {
+        t.join().unwrap();
+    }
+
+    let mut vec_ref = vec.lock().unwrap();
+    vec_ref.sort_unstable_by_key(|v| *v);
+
+    assert_eq!(vec_ref.as_slice(), &expection);
+}
+
+#[test]
+#[cfg(not(miri))]
 fn sync_sparse_array_min_max() {
     let array = sync_array();
 
@@ -375,6 +451,7 @@ fn sync_sparse_array_min_max() {
 }
 
 #[test]
+#[cfg(not(miri))]
 fn sync_sparse_array() {
     assert_eq!(std::mem::size_of::<SyncSparseArray<u128>>(), 2056);
 
