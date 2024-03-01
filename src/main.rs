@@ -6,8 +6,7 @@ use std::{
     sync::atomic::{AtomicPtr, Ordering},
 };
 
-unsafe impl<T, const N: usize> Send for IVecSnapshot<T, N> {}
-unsafe impl<T, const N: usize> Sync for IVecSnapshot<T, N> {}
+// SAFETY: Fields ordering and their types between IVecSnapshot and IVecSnapshotUnsized must be same, then casting between IVecSnapshot<T, 0> -> IVecSnapshotUnsized<T> is safe
 
 #[repr(C)]
 struct IVecSnapshot<T, const LEN: usize = 0> {
@@ -23,11 +22,16 @@ struct IVecSnapshotUnsized<T> {
     data: [T],
 }
 
+// SAFETY: We can't add non send/sync entries into ivec, that why we don't need to bound T with Send + Sync
 struct IVec<T> {
     root: AtomicPtr<u8>,
     _marker: PhantomData<T>,
 }
 
+// IMPORTANT: We should be very carefully with dereferencing `IVec` as slice
+//            because this allows us take reference to value in cleared snapshot.
+//            Better approach will be to create custom iterator that returns value clones
+//            and validate pointer every call
 impl<T> Deref for IVec<T> {
     type Target = [T];
 
@@ -169,26 +173,25 @@ impl<T> IVec<T> {
         }
     }
 
-    unsafe fn _clear_prev_snapshots(&self, root_ptr: *mut u8) -> bool {
-        let ivec = unsafe { &*read_unsized_ivec::<T>(root_ptr) };
-        if ivec.len == 0 {
-            return false;
+    unsafe fn _clear_prev_snapshots(&self, root_ptr: *mut u8) -> Option<usize> {
+        let &IVecSnapshotUnsized { len, prev, .. } = unsafe { &*read_unsized_ivec::<T>(root_ptr) };
+        if len == 0 {
+            return None;
         }
 
-        let prev_ivec = read_unsized_ivec::<ManuallyDrop<T>>(ivec.prev);
-        let prev_len = unsafe { &*prev_ivec }.len;
+        let prev_len = unsafe { (*read_unsized_ivec::<T>(prev)).len };
         if prev_len != 0 {
-            unsafe { read_mut_unsized_ivec::<ManuallyDrop<T>>(ivec.prev).drop_in_place() }
-            unsafe { dealloc(ivec.prev, get_ivec_layout::<T>(prev_len)) }
+            unsafe { read_mut_unsized_ivec::<ManuallyDrop<T>>(prev).drop_in_place() }
+            unsafe { dealloc(prev, get_ivec_layout::<T>(prev_len)) }
             let ivec = unsafe { &mut *read_mut_unsized_ivec::<T>(root_ptr) };
             ivec.prev = &IVecSnapshot { len: 0, data: [] as [T; 0], prev: std::ptr::null_mut() }
                 as *const _ as *mut _;
         }
 
-        true
+        Some(len)
     }
 
-    pub unsafe fn clear_prev_snapshots(&self) -> bool {
+    pub unsafe fn clear_prev_snapshots(&self) -> Option<usize> {
         let root_ptr = self.root.load(Ordering::Acquire);
         self._clear_prev_snapshots(root_ptr)
     }
@@ -197,15 +200,12 @@ impl<T> IVec<T> {
 impl<T> Drop for IVec<T> {
     fn drop(&mut self) {
         let root_ptr = self.root.load(Ordering::Acquire);
-        let is_prev_snapshots_cleared = unsafe { self._clear_prev_snapshots(root_ptr) };
-        if is_prev_snapshots_cleared {
-            let ivec_len = unsafe {
-                let root_mut = read_mut_unsized_ivec::<T>(root_ptr);
-                let len = (*root_mut).len;
-                root_mut.drop_in_place();
-                len
-            };
-            unsafe { dealloc(root_ptr, get_ivec_layout::<T>(ivec_len)) }
+        let clear_op_result = unsafe { self._clear_prev_snapshots(root_ptr) };
+        if let Some(ivec_len) = clear_op_result {
+            unsafe {
+                read_mut_unsized_ivec::<T>(root_ptr).drop_in_place();
+                dealloc(root_ptr, get_ivec_layout::<T>(ivec_len));
+            }
         }
     }
 }
@@ -227,6 +227,12 @@ impl IVecEntry<usize> for usize {
     }
 }
 
+impl IVecEntry<u8> for u8 {
+    fn ivec_id(&self) -> u8 {
+        *self
+    }
+}
+
 impl<T> IVecEntry<usize> for (usize, T) {
     fn ivec_id(&self) -> usize {
         self.0
@@ -234,7 +240,7 @@ impl<T> IVecEntry<usize> for (usize, T) {
 }
 
 fn main() {
-    let ivec = IVec::new();
+    let ivec: IVec<usize> = IVec::new();
 
     println!("{}", ivec.len());
 
@@ -248,32 +254,33 @@ fn main() {
 }
 
 #[test]
-fn ivec_upsert_sort() {
-    let ivec: IVec<usize> = IVec::new();
+fn ivec_static_upsert_sort() {
+    static IVEC: IVec<usize> = IVec::new();
     let expection: Vec<usize> = (100..5000).step_by(123).collect();
 
     for value in (100..5000).step_by(123).rev() {
-        ivec.get_or_insert(value, &|| value);
-        ivec.get_or_insert(value, &|| value);
+        IVEC.get_or_insert(value, &|| value);
+        IVEC.get_or_insert(value, &|| value);
     }
 
-    assert_eq!(ivec[..], expection[..]);
+    assert_eq!(IVEC[..], expection[..]);
 }
 
 #[test]
 fn ivec_snapshot_clear() {
     let ivec: IVec<usize> = IVec::new();
 
-    ivec.get_or_insert(4, &|| 4);
+    let _x = ivec.get_or_insert(4, &|| 4);
     ivec.get_or_insert(2, &|| 2);
     ivec.get_or_insert(1, &|| 1);
     ivec.get_or_insert(3, &|| 3);
 
-    assert!(unsafe { ivec.clear_prev_snapshots() });
-    assert!(unsafe { ivec.clear_prev_snapshots() });
+    assert!(unsafe { ivec.clear_prev_snapshots().is_some() });
+    assert!(unsafe { ivec.clear_prev_snapshots().is_some() });
 
-    let empty_ivec: IVec<()> = IVec::new();
-    assert!(!unsafe { empty_ivec.clear_prev_snapshots() });
+    // Derefrencing *_x at this point is invalid, but we can't test this
+    // you can uncomment following line and run this test with miri
+    // println!("{}", *_x);
 
     assert_eq!(&ivec[..], &[1, 2, 3, 4]);
 }
@@ -287,29 +294,35 @@ fn ivec_custom_align() {
         y: u128,
     }
 
-    let ivec_1: IVec<_> = IVec::new();
-    ivec_1.get_or_insert(0, &|| (0, DifferentAlign { x: 0, y: 0 }));
+    let ivec: IVec<_> = IVec::new();
+    ivec.get_or_insert(0, &|| (0, DifferentAlign { x: 0, y: 0 }));
+    drop(ivec);
 
-    drop(ivec_1);
+    let ivec: IVec<u8> = IVec::new();
+    ivec.get_or_insert(1, &|| 1);
+    ivec.get_or_insert(2, &|| 2);
+    ivec.get_or_insert(3, &|| 3);
+    drop(ivec);
 }
 
 #[test]
-fn ivec_empty_drop() {
+fn ivec_empty_drop_clear() {
     // * ivec could be dropped without any allocations
 
-    let ivec_1: IVec<usize> = IVec::new();
-    let ivec_2: IVec<usize> = IVec::new();
+    let ivec_empty: IVec<usize> = IVec::new();
+    drop(ivec_empty);
 
-    drop(ivec_1);
-    drop(ivec_2)
+    let ivec_empty_cleared: IVec<()> = IVec::new();
+    assert!(unsafe { ivec_empty_cleared.clear_prev_snapshots().is_none() });
+    drop(ivec_empty_cleared);
 }
 
 #[test]
-fn ivec_mutli_thread_insert_double_free() {
+fn ivec_mutli_thread_insert_drop() {
     // * ivec can store ref-counting types
-    // * ivec propperly call drop only once for stored values, but also propperly clear all memory
+    // * ivec propperly call drop only once for stored values and dealloc all memory
     // * ivec code doesn't cause double memory free
-
+    // * in case of collision ivec propperly drop non inserted value
     use std::sync::Arc;
 
     let ivec_arc = Arc::new(IVec::new());
