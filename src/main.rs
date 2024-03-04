@@ -52,8 +52,8 @@ fn main() {
 
     let mut x = [1; 24];
     let (x, y) = x.split_at_mut(5);
-    let z = &mut x[0];
-    let y = &mut y[0];
+    // let z = &mut x[0];
+    // let y = &mut y[0];
 
     println!("{:?}", _deleted_value);
 }

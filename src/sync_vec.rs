@@ -1,6 +1,8 @@
 use std::{
     cell::UnsafeCell,
+    marker::PhantomData,
     mem::MaybeUninit,
+    ops::Index,
     sync::atomic::{AtomicPtr, AtomicU32, AtomicU8, Ordering},
 };
 
@@ -11,9 +13,6 @@ struct SyncVecChunk<T> {
     next: AtomicPtr<SyncVecChunk<T>>,
     raw_len: AtomicU8,
     len: AtomicU8,
-    // Relevant only for root node,
-    // If there less than 254 chunks, then contains total amount of chunks, else just equals to u8::MAX - 1
-    chunks_size: AtomicU8,
     // Relevant only for root node
     // Contains total amount of items for all chunks
     entries_size: AtomicU32,
@@ -30,7 +29,7 @@ struct SyncVec<T> {
 
 impl<T> SyncVec<T> {
     const fn new() -> Self {
-        SyncVec { root_chunk: SyncVecChunk::new() }
+        SyncVec { root_chunk: unsafe { SyncVecChunk::new() } }
     }
 
     fn size(&self) -> usize {
@@ -56,7 +55,7 @@ impl<T> SyncVec<T> {
             while raw_len >= (SYNC_VEC_BUCKET_SIZE * (chunk_idx + 1)) {
                 let mut chunk_ptr = chunk.next.load(Ordering::Acquire);
                 if chunk_ptr.is_null() {
-                    chunk_ptr = chunk.try_init_next_chunk(&self.root_chunk.chunks_size);
+                    chunk_ptr = unsafe { chunk.try_init_next_chunk() };
                 }
                 chunk = unsafe { &*chunk_ptr };
                 chunk_idx += 1;
@@ -77,9 +76,21 @@ impl<T> SyncVec<T> {
         unsafe { &*slot_ptr }
     }
 
-    // this function is unsafe because it may returns `u8::MAX` instead of real chunk size
+    // iterator over chunks, this function unsafe just to make sure
+    // that user understand contract for such iteration
+    unsafe fn chunks<'a>(&'a self) -> ChunksIterator<'a, T> {
+        ChunksIterator {
+            chunk: &self.root_chunk as *const _,
+            iterations: self.size(),
+            _marker: PhantomData {},
+        }
+    }
+
+    // this function doesn't return real amount
     unsafe fn chunks_size(&self) -> usize {
-        self.root_chunk.chunks_size.load(Ordering::Acquire) as usize
+        ((self.root_chunk.entries_size.load(Ordering::Acquire) as f32)
+            / SYNC_VEC_BUCKET_SIZE as f32)
+            .ceil() as usize
     }
 
     // this function reseat length of all chunks:
@@ -122,10 +133,6 @@ impl<T> SyncVec<T> {
     }
 }
 
-// impl Iterator {
-//
-// }
-
 impl<T> Drop for SyncVecChunk<T> {
     fn drop(&mut self) {
         let next_ptr = self.next.load(Ordering::Acquire);
@@ -142,11 +149,9 @@ impl<T> Drop for SyncVecChunk<T> {
 }
 
 impl<T> SyncVecChunk<T> {
-    const fn new() -> SyncVecChunk<T> {
+    const unsafe fn new() -> SyncVecChunk<T> {
         SyncVecChunk {
             next: AtomicPtr::new(std::ptr::null_mut()),
-            // the amount of occupied slots, this propery increased every time thread want to init memory
-            chunks_size: AtomicU8::new(1),
             raw_len: AtomicU8::new(0),
             entries_size: AtomicU32::new(0),
             // the amount of initiated items, this property increaed only after item fully initiated
@@ -155,7 +160,11 @@ impl<T> SyncVecChunk<T> {
         }
     }
 
-    fn try_init_next_chunk(&self, chunks_size: &AtomicU8) -> *mut SyncVecChunk<T> {
+    unsafe fn get_unchecked(&self, index: usize) -> &T {
+        unsafe { &*((self.values.get() as *const T).add(index)) }
+    }
+
+    unsafe fn try_init_next_chunk(&self) -> *mut SyncVecChunk<T> {
         let next_chunk = Box::into_raw(Box::new(SyncVecChunk::new()));
         let swap_result = self.next.compare_exchange(
             std::ptr::null_mut(),
@@ -165,20 +174,74 @@ impl<T> SyncVecChunk<T> {
         );
 
         match swap_result {
-            Ok(_) => {
-                if chunks_size.load(Ordering::Relaxed) != u8::MAX {
-                    let _ = chunks_size.fetch_update(Ordering::Release, Ordering::Acquire, |v| {
-                        Some(v.saturating_add(1))
-                    });
-                }
-                next_chunk
-            }
+            Ok(_) => next_chunk,
             Err(new_next_chunk) => {
                 unsafe { drop(Box::from_raw(next_chunk)) }
                 new_next_chunk
             }
         }
     }
+}
+
+struct ChunksIterator<'a, T> {
+    chunk: *const SyncVecChunk<T>,
+    iterations: usize,
+    _marker: PhantomData<&'a T>,
+}
+
+impl<'a, T> Iterator for ChunksIterator<'a, T> {
+    type Item = ChunkIteratorItem<'a, T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.iterations == 0 {
+            return None;
+        }
+
+        let next_iterations = self.iterations.saturating_sub(SYNC_VEC_BUCKET_SIZE);
+        let len = if next_iterations == 0 { self.iterations } else { SYNC_VEC_BUCKET_SIZE };
+        let result = ChunkIteratorItem { chunk: unsafe { &(*self.chunk) }, len };
+
+        self.iterations = next_iterations;
+        self.chunk = result.chunk.next.load(Ordering::Acquire);
+
+        Some(result)
+    }
+}
+
+struct ChunkIteratorItem<'a, T> {
+    chunk: &'a SyncVecChunk<T>,
+    len: usize,
+}
+
+impl<'a, T> ChunkIteratorItem<'a, T> {
+    pub unsafe fn len(&self) -> usize {
+        self.len
+    }
+}
+
+impl<'a, T> Index<usize> for ChunkIteratorItem<'a, T> {
+    type Output = T;
+    fn index(&self, index: usize) -> &'a Self::Output {
+        unsafe { &*((self.chunk.values.get() as *const T).add(index)) }
+    }
+}
+
+#[test]
+fn iter() {
+    let sync_vec = SyncVec::new();
+    for i in 0..SYNC_VEC_BUCKET_SIZE {
+        sync_vec.push(Box::new(i));
+    }
+
+    let mut vec = Vec::new();
+    for chunk in unsafe { sync_vec.chunks() } {
+        for i in 0..unsafe { chunk.len() } {
+            let item = &chunk[i];
+            vec.push(*Box::as_ref(item))
+        }
+    }
+
+    assert_eq!(&vec, &(0..SYNC_VEC_BUCKET_SIZE).collect::<Vec<usize>>());
 }
 
 #[test]
@@ -244,7 +307,7 @@ fn reset() {
     unsafe { sync_vec.reset() };
 
     assert_eq!(sync_vec.size(), 0);
-    assert_eq!(unsafe { sync_vec.chunks_size() }, 600 / SYNC_VEC_BUCKET_SIZE + 1);
+    assert_eq!(unsafe { sync_vec.chunks_size() }, 0);
 
     let mut vec = Vec::new();
     for idx in 0..500 {
@@ -264,7 +327,7 @@ fn reset() {
         }
     }
 
-    assert_eq!(unsafe { sync_vec.chunks_size() }, 600 / SYNC_VEC_BUCKET_SIZE + 1);
+    assert_eq!(unsafe { sync_vec.chunks_size() }, 500 / SYNC_VEC_BUCKET_SIZE + 1);
     assert_eq!(&(0..500).rev().collect::<Vec<usize>>(), &vec);
 }
 

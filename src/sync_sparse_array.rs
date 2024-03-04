@@ -1,4 +1,3 @@
-use core::panic;
 use std::{
     mem::MaybeUninit,
     sync::atomic::{AtomicBool, AtomicPtr, AtomicU16, AtomicU64, Ordering},
