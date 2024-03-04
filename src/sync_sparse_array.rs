@@ -1,3 +1,4 @@
+use core::panic;
 use std::{
     mem::MaybeUninit,
     sync::atomic::{AtomicBool, AtomicPtr, AtomicU16, AtomicU64, Ordering},
@@ -5,13 +6,13 @@ use std::{
 };
 
 // Total amount of buckets per single array
-// single backet occupied 8bytes of space,
+// single bucket occupied 8bytes of space,
 // 128 bucket == 1kb of space
 const BUCKETS_PER_ARRAY: usize = 128; // value must be module of 2
+const BITS_PER_BUCKET: usize = u64::BITS as usize;
 
-// Total amount of items that could be stored by buckets
-// which close to the start of array
-const BUCKET_DENSITY: usize = 64; // value must be 64 or should be
+// Total amount of items that could be stored per bucket
+const BUCKET_DENSITY: usize = BITS_PER_BUCKET; // Currently this value MUST equals to bits count in AutomicU64
 
 // Default size of every array should be ~ 1kb
 // first 4096 elements is stored in chunks by 64 items
@@ -190,20 +191,21 @@ impl<T> BucketRefMut<T> {
     pub fn set(&mut self, id: usize, data: T) -> Option<T> {
         assert!(id < MAX_ITEMS_PER_ARRAY);
 
-        let prev_value = std::mem::replace(
-            unsafe { (*self.bucket_ptr).slots.get_unchecked_mut(get_slot_index(id)) },
-            MaybeUninit::new(data),
-        );
-
-        let is_new_value =
-            (unsafe { (*self.bits).load(Ordering::Relaxed) } & (1 << get_slot_index(id))) == 0;
+        let slot_idx = get_slot_index(id);
+        let is_new_value = (unsafe { (*self.bits).load(Ordering::Relaxed) } & (1 << slot_idx)) == 0;
         if is_new_value {
+            let slot_ref = unsafe { (*self.bucket_ptr).slots.get_unchecked_mut(slot_idx) };
+            unsafe { (slot_ref as *mut MaybeUninit<T>).write(MaybeUninit::new(data)) }
             unsafe { (*self.bits).fetch_or(1 << get_slot_index(id), Ordering::Release) };
             unsafe { (*self.root).min_id.fetch_min(id as u16, Ordering::Acquire) };
             unsafe { (*self.root).max_id.fetch_max(id as u16, Ordering::Acquire) };
             None
         } else {
-            unsafe { Some(prev_value.assume_init()) }
+            let old_value = std::mem::replace(
+                unsafe { (*self.bucket_ptr).slots.get_unchecked_mut(slot_idx) },
+                MaybeUninit::new(data),
+            );
+            unsafe { Some(old_value.assume_init()) }
         }
     }
 
@@ -221,7 +223,7 @@ impl<T> BucketRefMut<T> {
             let mut min = MAX_ITEMS_PER_ARRAY;
             let mut max = 0;
 
-            if current_min == id && current_min != current_max {
+            if current_min >= id && current_min != current_max {
                 'min_search: for bucket_idx in (current_min / 64)..=(current_max / 64) {
                     let bits =
                         unsafe { (*self.root).bucket_bits[bucket_idx].load(Ordering::Acquire) };
@@ -231,6 +233,8 @@ impl<T> BucketRefMut<T> {
 
                     for bit_index in 0..BUCKET_DENSITY {
                         if (bits & (1 << bit_index)) != 0 {
+                            dbg!(min, bucket_idx * BUCKET_DENSITY + bit_index);
+
                             min = min.min(bucket_idx * BUCKET_DENSITY + bit_index);
                             break 'min_search;
                         }
@@ -239,7 +243,7 @@ impl<T> BucketRefMut<T> {
             }
 
             if current_max == id && current_min != current_max {
-                for bucket_idx in ((current_min / 64)..=(current_max / 64)).rev() {
+                'max_search: for bucket_idx in ((current_min / 64)..=(current_max / 64)).rev() {
                     let bits =
                         unsafe { (*self.root).bucket_bits[bucket_idx].load(Ordering::Acquire) };
                     if bits == 0 {
@@ -249,7 +253,7 @@ impl<T> BucketRefMut<T> {
                     for bit_index in 0..BUCKET_DENSITY {
                         if (bits & (1 << bit_index)) != 0 {
                             max = max.max(bucket_idx * BUCKET_DENSITY + bit_index);
-                            break;
+                            break 'max_search;
                         }
                     }
                 }
@@ -382,37 +386,55 @@ fn test_bucket_lock_api() {
 
 #[test]
 fn test_bucket_multithread_read_write() {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
-    let array: SyncSparseArray<Arc<u32>> = sync_array();
-    let sparse: &'static SyncSparseArray<_> = unsafe { std::mem::transmute(&array) };
+    let array: SyncSparseArray<Arc<usize>> = sync_array();
+    let sparse: &'static SyncSparseArray<Arc<usize>> = unsafe { std::mem::transmute(&array) };
+
     let threads: Vec<_> = (100..1250)
         .step_by(30)
-        .map(|value| {
-            let id = Arc::new(value);
+        .map(|id| {
             std::thread::spawn(move || {
-                let mut bucket = sparse.bucket_lock(*id);
-                bucket.set(*id, id);
+                let mut bucket = sparse.bucket_lock(id);
+                // testing that values propperly dropping after replacing
+                let new_arc = Arc::new(id);
+                {
+                    bucket.set(id, new_arc.clone());
+                    let prev_value = bucket.set(id, new_arc.clone());
+                    assert_eq!(Arc::strong_count(&new_arc), 3);
+                    drop(prev_value)
+                }
+                // previous inserted arc propperly dropped
+                assert_eq!(Arc::strong_count(&new_arc), 2);
             })
         })
         .collect();
 
+    let vec: Arc<Vec<AtomicU64>> = Arc::new((100..1250).step_by(30).map(AtomicU64::new).collect());
     for t in threads {
         t.join().unwrap();
     }
 
-    let expection: Vec<_> = (100..1250).step_by(30).collect();
-    let vec = Arc::new(Mutex::new(Vec::new()));
-    let threads: Vec<_> = (0..BUCKETS_PER_ARRAY)
+    assert_eq!(sparse.min_relaxed(), 100);
+    assert_eq!(sparse.max_relaxed(), 1240);
+
+    let threads: Vec<_> = (0usize..BUCKETS_PER_ARRAY)
         .map(|bucket_id| {
             let vec = vec.clone();
             std::thread::spawn(move || {
                 let bucket = sparse.bucket(bucket_id * 64);
-                for bit_id in 0..64 {
+                for bit_id in 0..BITS_PER_BUCKET {
                     let bit = bucket.bits() & (1 << bit_id);
                     if bit != 0 {
-                        let value = **unsafe { bucket.get_unchecked(bucket_id * 64 + bit_id) };
-                        vec.lock().unwrap().push(value);
+                        let value =
+                            **unsafe { bucket.get_unchecked(bucket_id * BITS_PER_BUCKET + bit_id) }
+                                as u64;
+                        if let Some(pos) = vec
+                            .iter()
+                            .position(|array_value| array_value.load(Ordering::Acquire) == value)
+                        {
+                            vec[pos].store(0, Ordering::Release)
+                        }
                     }
                 }
             })
@@ -423,10 +445,44 @@ fn test_bucket_multithread_read_write() {
         t.join().unwrap();
     }
 
-    let mut vec_ref = vec.lock().unwrap();
-    vec_ref.sort_unstable_by_key(|v| *v);
+    let expection: Vec<_> = (100..1250).step_by(30).map(|_| 0).collect();
+    assert_eq!(vec.iter().map(|v| v.load(Ordering::Acquire)).collect::<Vec<_>>(), expection);
 
-    assert_eq!(vec_ref.as_slice(), &expection);
+    #[allow(dropping_references)]
+    drop(sparse);
+    drop(array);
+}
+
+#[test]
+fn test_bucket_multithread_delete() {
+    use std::sync::Arc;
+
+    let sparse = Arc::new(sync_array());
+    for i in (100..1250).step_by(30) {
+        sparse.set_in_place(i, Arc::new(i));
+    }
+
+    assert_eq!(sparse.min_relaxed(), 100);
+    assert_eq!(sparse.max_relaxed(), 1240);
+
+    let threads: Vec<_> = (100..1250)
+        .step_by(30)
+        .map(|id| {
+            let array = sparse.clone();
+            std::thread::spawn(move || array.delete_in_place(id))
+        })
+        .collect();
+
+    for t in threads {
+        t.join().unwrap();
+    }
+
+    assert_eq!(sparse.min_id.load(Ordering::Acquire), MAX_ITEMS_PER_ARRAY as u16);
+    assert_eq!(sparse.max_id.load(Ordering::Acquire), 0);
+
+    for i in (100..1250).step_by(30) {
+        assert_eq!(sparse.bits(i), 0);
+    }
 }
 
 #[test]
