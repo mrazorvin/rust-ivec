@@ -749,6 +749,82 @@ impl<T: SparseSlot> Drop for SparseArray<T> {
     }
 }
 
+/// <- 16 archetype -> <- 16 index ->
+///
+/// EntityId(u64::MAX) -> non exist entity
+/// EntityId(0)        -> invalid / non exists entity
+///
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[repr(C)]
+struct EntityId {
+    id: NonZeroU16,
+    arch: NonZeroU16,
+}
+
+#[cfg(test)]
+impl EntityId {
+    pub fn id(&self) -> NonZeroU16 {
+        self.id
+    }
+
+    pub fn arch(&self) -> NonZeroU16 {
+        self.arch
+    }
+}
+
+#[cfg(test)]
+impl Default for EntityId {
+    fn default() -> Self {
+        EntityId {
+            arch: unsafe { NonZeroU16::new_unchecked(u16::MAX) },
+            id: unsafe { NonZeroU16::new_unchecked(u16::MAX) },
+        }
+    }
+}
+
+#[cfg(test)]
+impl SparseSlot for EntityId {
+    fn get_id(&self) -> NonZeroU16 {
+        self.id()
+    }
+}
+
+#[cfg(test)]
+impl SparseArray<EntityId> {
+    pub fn get(&self, entity: EntityId) -> &EntityId {
+        self.get_(entity.id().get())
+    }
+
+    pub fn get_mut(&mut self, id: NonZeroU16) -> &mut EntityId {
+        self.first_mut_(id.get())
+    }
+}
+
+#[cfg(test)]
+mod entity_id {
+    use super::EntityId;
+
+    pub fn invalid_new(raw_id: u16) -> EntityId {
+        assert!(raw_id != 0);
+
+        EntityId {
+            id: unsafe { std::num::NonZeroU16::new_unchecked(raw_id) },
+            arch: unsafe { std::num::NonZeroU16::new_unchecked(u16::MAX) },
+        }
+    }
+
+    pub fn new(raw_id: u16, raw_arch: u16) -> EntityId {
+        assert!(raw_id != 0 && raw_id != u16::MAX);
+        assert!(raw_arch != 0 && raw_arch != u16::MAX);
+
+        EntityId {
+            id: unsafe { std::num::NonZeroU16::new_unchecked(raw_id) },
+            arch: unsafe { std::num::NonZeroU16::new_unchecked(raw_arch) },
+        }
+    }
+}
+
 #[test]
 fn zero_entities() {
     // get_first* methods is the fastest way to get value from array
@@ -791,9 +867,6 @@ fn inserting_and_reading_entities() {
     // * non-conflicting id's update exited slot without re-hashing
     // * array length equal to hash length
     // * array correctly shrink additional slot's when they non needed
-
-    use crate::ecs::entity::entity_id;
-    use crate::ecs::entity::entity_id::EntityId;
 
     let entity1 = entity_id::invalid_new(1);
     let entity237 = entity_id::invalid_new(237);
@@ -849,8 +922,6 @@ fn inserting_and_reading_entities() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn alot_of_items() {
-    use crate::ecs::entity::entity_id;
-    use crate::ecs::entity::entity_id::EntityId;
     let mut array = SparseArray::<EntityId>::new();
     for i in 1u16..u16::MAX {
         let entity = entity_id::invalid_new(i);
@@ -867,9 +938,6 @@ fn alot_of_items() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn no_hash() {
-    use crate::ecs::entity::entity_id;
-    use crate::ecs::entity::entity_id::EntityId;
-
     let mut array = SparseArray::<EntityId>::new();
     array.hash_disabled = true;
     assert_eq!(array.hash_disabled, true);
@@ -910,9 +978,6 @@ fn disabled_hashing() {
     // * user may insert multiple values without re-hashing
     // * table correctly switch from hash to sparse variant
     // * inserting ignore u16::MAX value
-
-    use crate::ecs::entity::entity_id;
-    use crate::ecs::entity::entity_id::EntityId;
 
     let entity32000 = entity_id::invalid_new(32000);
     let entity2371 = entity_id::invalid_new(2371);
@@ -969,9 +1034,6 @@ fn disabled_hashing() {
 
 #[test]
 fn multi_collision_hashing() {
-    use crate::ecs::entity::entity_id;
-    use crate::ecs::entity::entity_id::EntityId;
-
     // to make array dense as possible, when hash greater than 50,
     // we allow more than one collision, this is possible by packing
     // conflicting id's into array holes
@@ -1050,9 +1112,6 @@ fn multi_collision_hashing() {
 
 #[test]
 fn delete_multi_collision_hashing() {
-    use crate::ecs::entity::entity_id;
-    use crate::ecs::entity::entity_id::EntityId;
-
     let mut array: SparseArray<EntityId> = SparseArray::new();
 
     // 45, 98, 151 collide when hash=53
@@ -1163,9 +1222,6 @@ fn delete_multi_collision_hashing() {
 
 #[test]
 fn delete_no_collision() {
-    use crate::ecs::entity::entity_id;
-    use crate::ecs::entity::entity_id::EntityId;
-
     let mut array = SparseArray::<EntityId>::new();
     array.hash_disabled = true;
 
@@ -1213,7 +1269,6 @@ fn delete_no_collision() {
 
 #[test]
 fn set_bit_on_hash_disabled() {
-    use crate::ecs::entity::entity_id;
     let mut array = SparseArray::new();
     array.hash_disabled = true;
     assert_eq!(array.set(entity_id::invalid_new(100)), SetOpResult::UpsertHashDisabled);
@@ -1223,7 +1278,6 @@ fn set_bit_on_hash_disabled() {
 
 #[test]
 fn set_bit_on_insert_rehash() {
-    use crate::ecs::entity::entity_id;
     let mut array = SparseArray::new();
     assert_eq!(array.set(entity_id::invalid_new(100)), SetOpResult::InsertRehash);
     assert_eq!(array.data_slots_max, 100);
@@ -1232,7 +1286,6 @@ fn set_bit_on_insert_rehash() {
 
 #[test]
 fn set_bit_on_insert_min() {
-    use crate::ecs::entity::entity_id;
     let mut array = SparseArray::new();
     assert_eq!(array.set(entity_id::invalid_new(100)), SetOpResult::InsertRehash);
     assert_eq!(array.set(entity_id::invalid_new(2)), SetOpResult::Insert);
@@ -1242,7 +1295,6 @@ fn set_bit_on_insert_min() {
 
 #[test]
 fn set_bit_on_insert_packed_max() {
-    use crate::ecs::entity::entity_id;
     let mut array = SparseArray::new();
     assert_eq!(array.set(entity_id::invalid_new(100)), SetOpResult::InsertRehash);
     assert_eq!(array.set(entity_id::invalid_new(101)), SetOpResult::Insert);
@@ -1252,8 +1304,6 @@ fn set_bit_on_insert_packed_max() {
 
 #[test]
 fn delete_bit() {
-    use crate::ecs::entity::entity_id;
-
     let mut array = SparseArray::new();
     let _ = (array.set(entity_id::invalid_new(100)), array.set(entity_id::invalid_new(101)));
     assert_eq!((array.data_slots_min, array.data_slots_max), (100, 101));
@@ -1269,7 +1319,6 @@ fn delete_bit() {
 
 #[test]
 fn shrink_when_hash_disabled() {
-    use crate::ecs::entity::entity_id;
     let mut array = SparseArray::new();
     array.hash_disabled = true;
 
@@ -1298,7 +1347,6 @@ fn shrink_when_hash_disabled() {
 
 #[test]
 fn shrink_when_hash() {
-    use crate::ecs::entity::entity_id;
     let mut array = SparseArray::new();
     for i in 1..=200 {
         array.set(entity_id::invalid_new(i));
@@ -1322,7 +1370,6 @@ fn shrink_when_hash() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn sparse_integration() {
-    use crate::ecs::entity::entity_id;
     // * this test all possible insertion types
     // * include transition from hash -> hash disabled
     //  and all deletion types and backward transition from hash disabled -> hash variant
@@ -1347,9 +1394,6 @@ fn sparse_integration() {
 
 #[test]
 fn get_with_packing() {
-    use crate::ecs::entity::entity_id;
-    use crate::ecs::entity::entity_id::EntityId;
-
     // 45, 98, 151 collide when hash=53
     let mut array: SparseArray<EntityId> = SparseArray::new();
     let entity45 = entity_id::invalid_new(45);
@@ -1420,20 +1464,4 @@ fn capacity_size() {
 
     RawVecU16::push(&mut nums, 129);
     assert_eq!(nums.capacity(), 256);
-}
-
-impl SparseSlot for EntityId {
-    fn get_id(&self) -> NonZeroU16 {
-        self.id()
-    }
-}
-
-impl SparseArray<EntityId> {
-    pub fn get(&self, entity: EntityId) -> &EntityId {
-        self.get_(entity.id().get())
-    }
-
-    pub fn get_mut(&mut self, id: NonZeroU16) -> &mut EntityId {
-        self.first_mut_(id.get())
-    }
 }
