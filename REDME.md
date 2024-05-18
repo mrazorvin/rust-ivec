@@ -1,0 +1,1 @@
+Lock free data structures created for https://github.com/mrazorvin/rust-ecs

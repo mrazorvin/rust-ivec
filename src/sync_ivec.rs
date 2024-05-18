@@ -1,9 +1,25 @@
+use super::{
+    disposable::{DisposeItem, FrameDisposable},
+    sync_vec::SyncVec,
+};
 use std::{
     alloc::{dealloc, Layout},
+    any::TypeId,
+    cell::UnsafeCell,
+    fmt::Debug,
     marker::PhantomData,
     mem::{ManuallyDrop, MaybeUninit},
-    sync::atomic::{AtomicPtr, Ordering},
+    ops::{Deref, DerefMut},
+    sync::atomic::{AtomicBool, AtomicPtr, Ordering},
+    usize,
 };
+
+#[cfg(not(test))]
+pub static IVEC_DROP_SNAPSHOTS: SyncVec<DisposeItem> = SyncVec::new();
+
+#[cfg(test)]
+#[thread_local]
+pub static IVEC_DROP_SNAPSHOTS: SyncVec<DisposeItem> = SyncVec::new();
 
 // SAFETY: Fields ordering and their types between IVecSnapshot and IVecSnapshotUnsized must be same, then casting between IVecSnapshot<T, 0> -> IVecSnapshotUnsized<T> is safe
 
@@ -23,12 +39,21 @@ struct IVecSnapshotUnsized<T> {
 
 // SAFETY: We can't add non send/sync entries into ivec, that why we don't need to bound T with Send + Sync
 
+impl<T> FrameDisposable for IVec<T> {
+    unsafe fn dispose(&self) {
+        self.clear_prev_snapshots();
+        self.need_disposing.store(false, Ordering::Relaxed);
+    }
+}
+
 pub struct IVec<T> {
     root: AtomicPtr<u8>,
+    is_disposable_and_pinned: bool,
+    need_disposing: AtomicBool,
     _marker: PhantomData<T>,
 }
 
-pub trait IVecEntry<T: PartialEq + Eq + 'static> {
+pub trait IVecEntry<T: Ord> {
     fn ivec_id(&self) -> T;
 }
 
@@ -60,6 +85,21 @@ impl<T> IVec<T> {
                 prev: std::ptr::null_mut(),
                 data: [] as [T; 0],
             } as *const _ as *mut _),
+            need_disposing: AtomicBool::new(false),
+            is_disposable_and_pinned: false,
+            _marker: PhantomData {},
+        }
+    }
+
+    pub const unsafe fn new_pinned_and_disposable() -> Self {
+        Self {
+            root: AtomicPtr::new(&IVecSnapshot {
+                len: 0,
+                prev: std::ptr::null_mut(),
+                data: [] as [T; 0],
+            } as *const _ as *mut _),
+            need_disposing: AtomicBool::new(false),
+            is_disposable_and_pinned: true,
             _marker: PhantomData {},
         }
     }
@@ -71,10 +111,24 @@ impl<T> IVec<T> {
         &(*read_unsized_ivec(self.root.load(Ordering::Acquire))).data
     }
 
-    pub fn get_or_insert<TId>(&self, id: TId, init_data: &dyn Fn() -> T) -> T
+    pub fn get<TId>(&self, id: TId) -> Option<&T>
     where
-        TId: Ord + 'static,
-        T: Sync + Send + Clone + IVecEntry<TId>,
+        TId: Ord,
+        T: IVecEntry<TId>,
+    {
+        let root: &IVecSnapshotUnsized<T> =
+            unsafe { &*read_unsized_ivec(self.root.load(Ordering::Acquire)) };
+        if let Ok(result) = root.data.binary_search_by(|value| value.ivec_id().cmp(&id)) {
+            return root.data.get(result);
+        }
+
+        None
+    }
+
+    pub fn get_or_insert<TId>(&self, id: TId, init_data: &dyn Fn() -> T) -> &T
+    where
+        TId: Ord,
+        T: Sync + Send + Clone + IVecEntry<TId> + 'static,
     {
         // SAFETY: obvious safe, checking that all bits for default state is zero
         assert_eq!(vec![0u8; std::mem::size_of::<IVecSnapshot<T>>()].as_slice(), unsafe {
@@ -99,7 +153,7 @@ impl<T> IVec<T> {
         'new_version: loop {
             let root: &IVecSnapshotUnsized<T> = unsafe { &*read_unsized_ivec(root_ptr) };
             if let Ok(result) = root.data.binary_search_by(|value| value.ivec_id().cmp(&id)) {
-                return unsafe { root.data.get_unchecked(result).clone() };
+                return unsafe { root.data.get_unchecked(result) };
             }
 
             let new_vec_len = root.len + 1;
@@ -150,8 +204,17 @@ impl<T> IVec<T> {
 
             match root_switch {
                 Ok(_) => {
+                    if self.is_disposable_and_pinned && !self.need_disposing.load(Ordering::Acquire)
+                    {
+                        self.need_disposing.store(true, Ordering::Relaxed);
+                        IVEC_DROP_SNAPSHOTS.push(DisposeItem {
+                            data: unsafe { std::mem::transmute::<&_, &'static IVec<T>>(self) }
+                                as &dyn FrameDisposable
+                                as *const _,
+                        });
+                    }
                     let new_vec = unsafe { &*(new_vec_fat_ptr as *mut IVecSnapshotUnsized<T>) };
-                    break unsafe { new_vec.data.get_unchecked(root.len).clone() };
+                    break unsafe { new_vec.data.get_unchecked(root.len) };
                 }
                 Err(new_root_ptr) => {
                     let new_vec = unsafe { &mut *(new_vec_fat_ptr as *mut IVecSnapshotUnsized<T>) };
@@ -231,10 +294,215 @@ impl IVecEntry<u8> for u8 {
     }
 }
 
+impl<T> IVecEntry<TypeId> for (TypeId, T) {
+    fn ivec_id(&self) -> TypeId {
+        self.0
+    }
+}
+
 impl<T> IVecEntry<usize> for (usize, T) {
     fn ivec_id(&self) -> usize {
         self.0
     }
+}
+
+#[repr(transparent)]
+pub struct SameValIter<EntryID> {
+    inner: UnsafeCell<SameValIterInner<EntryID>>,
+}
+
+struct SameValIterInner<EntryID> {
+    finished: bool,
+    entry_id: MaybeUninit<EntryID>,
+    entry_max_id: MaybeUninit<EntryID>,
+}
+
+impl<EntryID> SameValIter<EntryID> {
+    pub fn new() -> Self {
+        SameValIter {
+            inner: UnsafeCell::new(SameValIterInner {
+                finished: true,
+                entry_id: MaybeUninit::zeroed(),
+                entry_max_id: MaybeUninit::zeroed(),
+            }),
+        }
+    }
+
+    pub fn add<'a, T>(&mut self, ivec: &'a IVec<T>) -> SameValIterState<'a, T>
+    where
+        EntryID: Ord + Debug,
+        T: IVecEntry<EntryID>,
+    {
+        let slice = unsafe { ivec.as_slice() };
+        let inner = self.inner.get_mut();
+        if !slice.is_empty() {
+            let next_min = slice.first().unwrap().ivec_id();
+            let next_max = slice.last().unwrap().ivec_id();
+            if inner.finished {
+                inner.entry_id = MaybeUninit::new(next_min);
+                inner.entry_max_id = MaybeUninit::new(next_max);
+                inner.finished = false;
+            } else {
+                if &next_min > unsafe { inner.entry_id.assume_init_ref() } {
+                    inner.entry_id = MaybeUninit::new(next_min);
+                }
+
+                if &next_max < unsafe { inner.entry_max_id.assume_init_ref() } {
+                    inner.entry_max_id = MaybeUninit::new(next_max);
+                }
+            }
+        }
+
+        SameValIterState { data: unsafe { std::mem::transmute(slice) }, idx: 0 }
+    }
+}
+
+pub struct SameValIterState<'a, T> {
+    pub data: &'a [T],
+    pub idx: usize,
+}
+
+pub struct SameValIterEntry<EntryID: 'static> {
+    entry_id: EntryID,
+    entry_id_next: EntryID,
+    valid: bool,
+    finished: bool,
+    iter_ref: *mut UnsafeCell<SameValIterInner<EntryID>>,
+}
+
+impl<EntryID> SameValIterEntry<EntryID> {
+    pub fn complete_is_valid(self) -> bool
+    where
+        EntryID: Copy,
+    {
+        if self.finished {
+            unsafe { (*self.iter_ref).get_mut().finished = true };
+        } else {
+            unsafe { (*self.iter_ref).get_mut().entry_id = MaybeUninit::new(self.entry_id_next) };
+        }
+        self.valid
+    }
+
+    #[inline]
+    pub fn progress<'a, T>(&mut self, state: &'a mut SameValIterState<T>) -> &'a T
+    where
+        EntryID: Ord + Copy + Debug,
+        T: IVecEntry<EntryID>,
+    {
+        let mut result = &state.data[0];
+        if !self.valid {
+            return result;
+        }
+
+        let mut i = state.idx;
+        let mut valid = false;
+        if state.data.len() < 20 {
+            while i < state.data.len() {
+                let id = state.data[i].ivec_id();
+                if id == self.entry_id {
+                    valid = true;
+                    result = &state.data[i];
+                    i += 1;
+                    break;
+                }
+                if id > self.entry_id {
+                    valid = false;
+                    break;
+                }
+                i += 1;
+            }
+        } else {
+            match state.data[state.idx..state.data.len()]
+                .binary_search_by_key(&self.entry_id, |v| v.ivec_id())
+            {
+                Ok(pos) => {
+                    valid = true;
+                    result = &state.data[state.idx + pos];
+                    i = state.idx + pos + 1;
+                }
+                Err(pos) => {
+                    valid = false;
+                    i = state.idx + pos;
+                }
+            }
+        }
+
+        if i >= state.data.len() {
+            self.finished = true;
+        } else {
+            self.entry_id_next = state.data[i].ivec_id().max(self.entry_id_next);
+        }
+
+        self.valid = self.valid && valid;
+        state.idx = i;
+
+        result
+    }
+}
+
+impl<EntryID: 'static + Copy + Ord + Debug> Iterator for SameValIter<EntryID> {
+    type Item = SameValIterEntry<EntryID>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let inner = self.inner.get_mut();
+        let entry_id_max = unsafe { inner.entry_max_id.assume_init() };
+        let entry_id = unsafe { inner.entry_id.assume_init() };
+        if entry_id > entry_id_max || inner.finished {
+            return None;
+        }
+
+        Some(SameValIterEntry {
+            entry_id,
+            entry_id_next: entry_id,
+            valid: true,
+            finished: false,
+            iter_ref: inner as *mut _ as *mut _,
+        })
+    }
+}
+
+#[test]
+fn ivec_zip_iter() {
+    use std::collections::HashSet;
+
+    let vec1 = IVec::new();
+    for value in (100usize..5000).step_by(123).rev() {
+        vec1.get_or_insert(value, &|| value);
+    }
+
+    let vec2 = IVec::new();
+    for value in (100usize..5000).step_by(369).rev() {
+        vec2.get_or_insert(value, &|| (value, value as f32));
+    }
+
+    let mut aggregation = Vec::new();
+
+    vec2.get_or_insert(101, &|| (101, 101.0));
+    vec2.get_or_insert(99, &|| (99, 99.0));
+    vec2.get_or_insert(3400, &|| (3400, 3400.0));
+
+    let mut same_iter = SameValIter::new();
+    let mut vec1_state = same_iter.add(&vec1);
+    let mut vec2_state = same_iter.add(&vec2);
+    'example_loop: loop {
+        for mut entry in &mut same_iter {
+            let val1 = entry.progress(&mut vec1_state); // move pointer according to algo above
+            let val2 = entry.progress(&mut vec2_state); // move pointer according to algo above
+            if entry.complete_is_valid() {
+                aggregation.push(*val1 + val2.0);
+                continue 'example_loop;
+            }
+        }
+        break;
+    }
+
+    let set1: HashSet<usize> = HashSet::from_iter(unsafe { vec1.as_slice().iter().copied() });
+    let set2: HashSet<usize> =
+        HashSet::from_iter(unsafe { vec2.as_slice().iter().map(|(id, _)| *id) });
+    let mut expection = set1.intersection(&set2).map(|v| *v + *v).collect::<Vec<usize>>();
+    expection.sort_by(usize::cmp);
+
+    assert_eq!(expection, aggregation);
 }
 
 #[test]
@@ -286,6 +554,9 @@ fn ivec_custom_align() {
     ivec.get_or_insert(1, &|| 1);
     ivec.get_or_insert(2, &|| 2);
     ivec.get_or_insert(3, &|| 3);
+
+    assert_eq!(IVEC_DROP_SNAPSHOTS.size(), 0);
+
     drop(ivec);
 }
 
@@ -298,6 +569,53 @@ fn ivec_empty_drop_clear() {
     let ivec_empty_cleared: IVec<()> = IVec::new();
     assert!(unsafe { ivec_empty_cleared.clear_prev_snapshots().is_none() });
     drop(ivec_empty_cleared);
+}
+
+#[test]
+fn ivec_mutli_global_gc() {
+    let t = std::thread::spawn(|| {
+        let mut vec = Vec::new();
+        for _ in 0..2 {
+            assert_eq!(IVEC_DROP_SNAPSHOTS.size(), 0);
+
+            let ivec1 = unsafe { IVec::new_pinned_and_disposable() };
+            ivec1.get_or_insert(1usize, &|| 1);
+            ivec1.get_or_insert(2usize, &|| 2);
+            assert_eq!(IVEC_DROP_SNAPSHOTS.size(), 1);
+
+            let ivec2 = unsafe { IVec::new_pinned_and_disposable() };
+            ivec2.get_or_insert(1usize, &|| (1, Box::new(1usize)));
+            ivec2.get_or_insert(2usize, &|| (2, Box::new(1)));
+            assert_eq!(IVEC_DROP_SNAPSHOTS.size(), 2);
+
+            // vec.push((ivec1, ivec2));
+            //
+            // this is unsafe because disposing required pinned memory
+            // but without owning pin we can't do anything
+
+            for chunk in IVEC_DROP_SNAPSHOTS.chunks() {
+                for i in 0..chunk.len() {
+                    unsafe { (*chunk[i].data).dispose() }
+                }
+            }
+            unsafe { IVEC_DROP_SNAPSHOTS.reset() }
+
+            // println!("{}", slice[0]); <- any access to refs after disposing is UB
+            vec.push((ivec1, ivec2));
+        }
+        vec
+    });
+
+    let vec = t.join().unwrap();
+
+    let values: Vec<_> = vec
+        .iter()
+        .flat_map(|(ivec1, ivec2)| unsafe {
+            ivec1.as_slice().iter().copied().chain(ivec2.as_slice().iter().map(|(_, v)| **v))
+        })
+        .collect();
+
+    assert_eq!(&values, &[1, 2, 1, 1, 1, 2, 1, 1]);
 }
 
 #[test]
