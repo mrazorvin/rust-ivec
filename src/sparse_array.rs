@@ -109,6 +109,7 @@ impl<T: SparseSlot> SparseArray<T> {
 }
 
 pub struct MemoryInfo {
+    #[allow(unused)]
     used: usize,
 }
 

@@ -1,10 +1,7 @@
 use super::sync_vec::{SyncVec, ZipRangeIterator};
 use std::{
-    collections::HashSet,
-    fmt::Debug,
     mem::MaybeUninit,
-    num::NonZeroU32,
-    sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, Ordering},
     u32,
 };
 

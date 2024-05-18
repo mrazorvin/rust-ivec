@@ -1,4 +1,5 @@
 #![feature(thread_local)]
+// FIXME replace with stable feature
 #![feature(core_intrinsics)]
 
 pub mod disposable;

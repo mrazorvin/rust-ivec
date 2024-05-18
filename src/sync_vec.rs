@@ -2,9 +2,8 @@ use std::{
     cell::UnsafeCell,
     marker::PhantomData,
     mem::MaybeUninit,
-    num::NonZeroU8,
     ops::Index,
-    sync::atomic::{AtomicPtr, AtomicU16, AtomicU32, AtomicU8, Ordering},
+    sync::atomic::{AtomicPtr, AtomicU16, AtomicU32, Ordering},
 };
 
 #[repr(C)] // 16 bytes
@@ -168,6 +167,7 @@ impl<T, const N: usize> SyncVecChunk<T, N> {
         }
     }
 
+    #[allow(unused)]
     #[inline]
     unsafe fn get_unchecked(&self, index: usize) -> &T {
         unsafe { &*((self.values.get() as *const T).add(index)) }

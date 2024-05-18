@@ -1,6 +1,4 @@
-use std::ops::{Deref, DerefMut};
-
-// could be implmented by any resource that needed end from disposing
+// could be implmented by any resource that needed end frame disposing
 pub trait FrameDisposable {
     unsafe fn dispose(&self);
 }

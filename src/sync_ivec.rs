@@ -9,7 +9,6 @@ use std::{
     fmt::Debug,
     marker::PhantomData,
     mem::{ManuallyDrop, MaybeUninit},
-    ops::{Deref, DerefMut},
     sync::atomic::{AtomicBool, AtomicPtr, Ordering},
     usize,
 };

@@ -1,14 +1,8 @@
-use core::panic;
-use std::any::Any;
 use std::cell::UnsafeCell;
-use std::io::Empty;
-use std::mem::{ManuallyDrop, MaybeUninit};
+use std::mem::ManuallyDrop;
 use std::ops::Deref;
-use std::panic::RefUnwindSafe;
-use std::ptr::addr_of;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, RwLockReadGuard};
-use std::time::Duration;
 use std::{hash::Hash, sync::RwLock};
 
 use std::collections::HashMap;
@@ -101,6 +95,7 @@ impl<Key, T> SyncMap<Key, T> {
         };
     }
 
+    #[allow(unused)]
     fn delete(&self, k: Key)
     where
         Key: Eq + Hash,
@@ -173,10 +168,12 @@ impl<Key, T> SyncMap<Key, T> {
         self.need_disposing.store(false, Ordering::Release);
     }
 
+    #[allow(unused)]
     fn ref_read(&self) -> &HashMap<Key, (T, AtomicU8)> {
         unsafe { &(*self.read.get()) }
     }
 
+    #[allow(unused)]
     fn ref_write(&self) -> RwLockReadGuard<'_, HashMap<Key, Option<Arc<T>>>> {
         self.write.read().expect("SyncMap.ref_write# poison guard")
     }
@@ -214,6 +211,9 @@ impl<'a, T> Deref for SyncMapSlot<'a, T> {
 
 #[test]
 fn sync_map() {
+    use std::ptr::addr_of;
+    use std::time::Duration;
+
     assert_eq!(std::mem::size_of::<SyncMap<String, u32>>(), 128);
 
     static UPDATED_SYNC_MAP: SyncVec<DisposeItem> = SyncVec::new();
