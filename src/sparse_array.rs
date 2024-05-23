@@ -2,7 +2,7 @@ use std::num::NonZeroU16;
 
 use super::{
     primes_u16::PRIME_U16,
-    raw_vec::{packed_capacity, PackedCapacity, RawVecU16},
+    raw_vec_u16::{packed_capacity, PackedCapacity, RawVecU16},
 };
 
 pub trait SparseSlot: Default {
@@ -1322,6 +1322,7 @@ fn delete_bit() {
 fn shrink_when_hash_disabled() {
     let mut array = SparseArray::new();
     array.hash_disabled = true;
+
 
     array.set(entity_id::invalid_new(3000));
     array.set(entity_id::invalid_new(4000));
